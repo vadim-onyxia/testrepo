@@ -9,7 +9,7 @@ export async function run() {
   try {
     // The `who-to-greet` input is defined in action metadata file
     const whoToGreet = core.getInput('who-to-greet', { required: true })
-    core.info(`Hellllllllloooo, ${whoToGreet}!`)
+    core.info(`Hello Jira Integration, ${whoToGreet}!`)
 
     // Get the current time and set as an output
     const time = new Date().toTimeString()
