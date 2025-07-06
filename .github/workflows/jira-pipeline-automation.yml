@@ -36,29 +36,49 @@ jobs:
             "https://onyxia.atlassian.net/rest/api/3/search?jql=parent=$1&fields=key,status"
         }
         
-        # Function to transition issue
+        # Function to transition issue - FIXED VERSION
         transition_issue() {
-          curl -X POST \
+          local issue_key=$1
+          local transition_id=$2
+          local comment_text=$3
+          
+          # Create JSON payload with proper escaping
+          local json_payload
+          json_payload=$(cat <<EOF
+        {
+          "transition": {
+            "id": "$transition_id"
+          },
+          "fields": {
+            "comment": {
+              "type": "doc",
+              "version": 1,
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "$comment_text"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+        EOF
+          )
+          
+          echo "Transitioning $issue_key with payload:"
+          echo "$json_payload"
+          
+          curl -v -X POST \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -H "Authorization: Basic ${{ secrets.JIRA_AUTH }}" \
-            -d "{
-              \"transition\": {\"id\": \"$2\"},
-              \"fields\": {
-                \"comment\": {
-                  \"type\": \"doc\",
-                  \"version\": 1,
-                  \"content\": [{
-                    \"type\": \"paragraph\",
-                    \"content\": [{
-                      \"type\": \"text\",
-                      \"text\": \"$3\"
-                    }]
-                  }]
-                }
-              }
-            }" \
-            "https://onyxia.atlassian.net/rest/api/3/issue/$1/transitions"
+            -d "$json_payload" \
+            "https://onyxia.atlassian.net/rest/api/3/issue/$issue_key/transitions"
         }
         
         # Process epic automation
@@ -68,16 +88,31 @@ jobs:
           
           # Get epic details
           epic_data=$(get_issue "$epic_key")
+          if [[ $? -ne 0 ]]; then
+            echo "Failed to get epic data for $epic_key"
+            return 1
+          fi
+          
           epic_status=$(echo "$epic_data" | jq -r '.fields.status.name')
+          if [[ "$epic_status" == "null" ]]; then
+            echo "Could not parse epic status for $epic_key"
+            return 1
+          fi
+          
           echo "Epic $epic_key current status: $epic_status"
           
           # Get tasks
           tasks_data=$(get_epic_tasks "$epic_key")
+          if [[ $? -ne 0 ]]; then
+            echo "Failed to get tasks for epic $epic_key"
+            return 1
+          fi
+          
           total_tasks=$(echo "$tasks_data" | jq '.issues | length')
           
           if [[ $total_tasks -eq 0 ]]; then
             echo "No tasks found for epic $epic_key"
-            return
+            return 0
           fi
           
           # Count task statuses
@@ -107,10 +142,20 @@ jobs:
           # Update epic if needed
           if [[ -n "$transition_id" ]]; then
             echo "Updating epic $epic_key to $new_epic_status"
-            transition_issue "$epic_key" "$transition_id" "🤖 Epic status updated: $done_tasks/$total_tasks tasks completed"
+            local comment="Epic status updated: $done_tasks/$total_tasks tasks completed"
             
-            # Update linked discovery idea
-            update_discovery "$epic_key" "$new_epic_status"
+            transition_result=$(transition_issue "$epic_key" "$transition_id" "$comment")
+            echo "Transition result: $transition_result"
+            
+            # Check if transition was successful
+            if echo "$transition_result" | grep -q "errorMessages"; then
+              echo "ERROR: Failed to transition epic $epic_key"
+              echo "$transition_result"
+            else
+              echo "SUCCESS: Epic $epic_key transitioned to $new_epic_status"
+              # Update linked discovery idea
+              update_discovery "$epic_key" "$new_epic_status"
+            fi
           else
             echo "Epic $epic_key status is correct: $epic_status"
           fi
@@ -127,7 +172,7 @@ jobs:
           
           if [[ -z "$discovery_key" || "$discovery_key" == "null" ]]; then
             echo "No discovery idea linked to epic $epic_key"
-            return
+            return 0
           fi
           
           echo "Found linked discovery: $discovery_key"
@@ -159,7 +204,18 @@ jobs:
           # Update discovery if needed
           if [[ -n "$discovery_transition_id" ]]; then
             echo "Updating discovery $discovery_key to $new_discovery_status"
-            transition_issue "$discovery_key" "$discovery_transition_id" "🤖 Discovery updated based on epic $epic_key status: $epic_status"
+            local comment="Discovery updated based on epic $epic_key status: $epic_status"
+            
+            transition_result=$(transition_issue "$discovery_key" "$discovery_transition_id" "$comment")
+            echo "Discovery transition result: $transition_result"
+            
+            # Check if transition was successful
+            if echo "$transition_result" | grep -q "errorMessages"; then
+              echo "ERROR: Failed to transition discovery $discovery_key"
+              echo "$transition_result"
+            else
+              echo "SUCCESS: Discovery $discovery_key transitioned to $new_discovery_status"
+            fi
           else
             echo "Discovery $discovery_key status is correct: $discovery_status"
           fi
@@ -182,7 +238,12 @@ jobs:
           
           epic_keys=$(echo "$epics_data" | jq -r '.issues[].key')
           
-          for epic_key in $epic_keys; do
-            process_epic "$epic_key"
-          done
+          if [[ -z "$epic_keys" ]]; then
+            echo "No active epics found in TRY project"
+          else
+            for epic_key in $epic_keys; do
+              echo "Processing epic: $epic_key"
+              process_epic "$epic_key"
+            done
+          fi
         fi
