@@ -1,0 +1,188 @@
+name: Jira Pipeline Automation
+
+on:
+  # Check for Jira status changes every 10 minutes
+  schedule:
+    - cron: '*/10 * * * *'
+  
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      test_epic:
+        description: 'Epic key to test (e.g., TRY-3)'
+        required: false
+        default: 'TRY-3'
+
+jobs:
+  jira-automation:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Epic Status Automation
+      run: |
+        # Function to get issue details
+        get_issue() {
+          curl -s -X GET \
+            -H "Accept: application/json" \
+            -H "Authorization: Basic ${{ secrets.JIRA_AUTH }}" \
+            "https://onyxia.atlassian.net/rest/api/3/issue/$1"
+        }
+        
+        # Function to get epic tasks
+        get_epic_tasks() {
+          curl -s -X GET \
+            -H "Accept: application/json" \
+            -H "Authorization: Basic ${{ secrets.JIRA_AUTH }}" \
+            "https://onyxia.atlassian.net/rest/api/3/search?jql=parent=$1&fields=key,status"
+        }
+        
+        # Function to transition issue
+        transition_issue() {
+          curl -X POST \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.JIRA_AUTH }}" \
+            -d "{
+              \"transition\": {\"id\": \"$2\"},
+              \"fields\": {
+                \"comment\": {
+                  \"type\": \"doc\",
+                  \"version\": 1,
+                  \"content\": [{
+                    \"type\": \"paragraph\",
+                    \"content\": [{
+                      \"type\": \"text\",
+                      \"text\": \"$3\"
+                    }]
+                  }]
+                }
+              }
+            }" \
+            "https://onyxia.atlassian.net/rest/api/3/issue/$1/transitions"
+        }
+        
+        # Process epic automation
+        process_epic() {
+          local epic_key=$1
+          echo "Processing epic: $epic_key"
+          
+          # Get epic details
+          epic_data=$(get_issue "$epic_key")
+          epic_status=$(echo "$epic_data" | jq -r '.fields.status.name')
+          echo "Epic $epic_key current status: $epic_status"
+          
+          # Get tasks
+          tasks_data=$(get_epic_tasks "$epic_key")
+          total_tasks=$(echo "$tasks_data" | jq '.issues | length')
+          
+          if [[ $total_tasks -eq 0 ]]; then
+            echo "No tasks found for epic $epic_key"
+            return
+          fi
+          
+          # Count task statuses
+          done_tasks=$(echo "$tasks_data" | jq '[.issues[].fields.status.name] | map(select(. == "Done")) | length')
+          in_progress_tasks=$(echo "$tasks_data" | jq '[.issues[].fields.status.name] | map(select(. == "In Progress")) | length')
+          
+          echo "Tasks: $done_tasks done, $in_progress_tasks in progress, total: $total_tasks"
+          
+          # Determine epic target status
+          new_epic_status=""
+          transition_id=""
+          
+          if [[ $done_tasks -eq $total_tasks ]]; then
+            # All tasks done
+            if [[ "$epic_status" != "Done" ]]; then
+              new_epic_status="Done"
+              transition_id="31"
+            fi
+          elif [[ $in_progress_tasks -gt 0 || $done_tasks -gt 0 ]]; then
+            # Some tasks in progress or done
+            if [[ "$epic_status" != "In Progress" ]]; then
+              new_epic_status="In Progress"
+              transition_id="21"
+            fi
+          fi
+          
+          # Update epic if needed
+          if [[ -n "$transition_id" ]]; then
+            echo "Updating epic $epic_key to $new_epic_status"
+            transition_issue "$epic_key" "$transition_id" "🤖 Epic status updated: $done_tasks/$total_tasks tasks completed"
+            
+            # Update linked discovery idea
+            update_discovery "$epic_key" "$new_epic_status"
+          else
+            echo "Epic $epic_key status is correct: $epic_status"
+          fi
+        }
+        
+        # Update discovery idea
+        update_discovery() {
+          local epic_key=$1
+          local epic_status=$2
+          
+          # Get epic details to find linked discovery
+          epic_data=$(get_issue "$epic_key")
+          discovery_key=$(echo "$epic_data" | jq -r '.fields.issuelinks[]? | select(.outwardIssue.fields.issuetype.name == "Idea") | .outwardIssue.key')
+          
+          if [[ -z "$discovery_key" || "$discovery_key" == "null" ]]; then
+            echo "No discovery idea linked to epic $epic_key"
+            return
+          fi
+          
+          echo "Found linked discovery: $discovery_key"
+          
+          # Get discovery current status
+          discovery_data=$(get_issue "$discovery_key")
+          discovery_status=$(echo "$discovery_data" | jq -r '.fields.status.name')
+          echo "Discovery $discovery_key current status: $discovery_status"
+          
+          # Determine discovery target status
+          new_discovery_status=""
+          discovery_transition_id=""
+          
+          case "$epic_status" in
+            "In Progress")
+              if [[ "$discovery_status" != "4.In development" ]]; then
+                new_discovery_status="4.In development"
+                discovery_transition_id="71"
+              fi
+              ;;
+            "Done")
+              if [[ "$discovery_status" != "5.Done (Staging)" ]]; then
+                new_discovery_status="5.Done (Staging)"
+                discovery_transition_id="21"
+              fi
+              ;;
+          esac
+          
+          # Update discovery if needed
+          if [[ -n "$discovery_transition_id" ]]; then
+            echo "Updating discovery $discovery_key to $new_discovery_status"
+            transition_issue "$discovery_key" "$discovery_transition_id" "🤖 Discovery updated based on epic $epic_key status: $epic_status"
+          else
+            echo "Discovery $discovery_key status is correct: $discovery_status"
+          fi
+        }
+        
+        # Main execution
+        if [[ -n "${{ github.event.inputs.test_epic }}" ]]; then
+          # Manual test mode
+          echo "Testing with epic: ${{ github.event.inputs.test_epic }}"
+          process_epic "${{ github.event.inputs.test_epic }}"
+        else
+          # Scheduled mode - check all active epics
+          echo "Checking all active epics..."
+          
+          # Get all epics in TRY project that are not Done
+          epics_data=$(curl -s -X GET \
+            -H "Accept: application/json" \
+            -H "Authorization: Basic ${{ secrets.JIRA_AUTH }}" \
+            "https://onyxia.atlassian.net/rest/api/3/search?jql=project=TRY AND issuetype=Epic AND status!=Done&fields=key")
+          
+          epic_keys=$(echo "$epics_data" | jq -r '.issues[].key')
+          
+          for epic_key in $epic_keys; do
+            process_epic "$epic_key"
+          done
+        fi
