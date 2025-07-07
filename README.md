@@ -20,6 +20,7 @@ follow the below instructions:
 1. Click **Create repository**
 1. Clone your new repository
 
+ 
 > [!CAUTION]
 >
 > Make sure to remove or update the [`CODEOWNERS`](./CODEOWNERS) file! For
